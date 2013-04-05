@@ -75,29 +75,69 @@ be populated and will need to be done manually."""[1:],
     }, 
 
     'config_path' : {
-        'info': '',
-        'prompt': '',
+        'info': """
+Enter the filename to which the configuration should be saved. If a filename
+is not specified, the configuration will be saved to `config.json` in the
+current directory.
+"""[1:]
+        'prompt': 'Configuration filename',
         'warning': '',
-        'warning_condition': lambda x: x == '',
+        'warning_condition': lambda x: False '',
         'hide': False,
     },
 
     'folder_list' : {
-        'info': '',
-        'prompt': '',
+        'info': """
+Specify the list of folders to exclude from migration as a comma separated
+list. Leading and trailing spaces betwen entries will be stripped.  By
+default, the following folders will not be migrated if the exist:
+
+Junk
+Trash
+
+If you want to include all folders, specify "-" as the list.  An empty 
+list will migrate all but the default excluded folders."""[1:],
+        'prompt': 'Excluded fodler list (comma separated)',
         'warning': '',
         'warning_condition': lambda x: False,
         'hide': False,
     },
 
     'gmail_email' : {
-        'info': '',
-        'prompt': '',
-        'warning': '',
+        'info': 'Enter the email address of the destination Gmail account',
+        'prompt': 'Gmail email address',
+        'warning': """
+If an email address is not specified, it will have to be manually entered into
+the configuration file before email can be migrated."""[1:],
         'warning_condition': lambda x: x == '',
         'hide': False,
     },
+
+    'gmail_admin' : {
+        'info': """
+Enter the email address of a Gmail domain administrator that has access to the
+migration API.  If the domain administrator has enabled access to the
+migration API for users, then this can be the same as the Gmail email above."""[1:],
+        'prompt': 'Gmail admin email address',
+        'warning': """
+Migration can not continue without specifying an account with access to the
+migration API."""[1:],
+        'warning_condition': lambda x: x == '',
+        'hide': False,
+    },
+
+    'gmail_password' : {
+        'info': 'Enter the password for the Gmail admin account',
+        'prompt': 'Gmail admin account password',
+        'warning': 'Migration can not continue without the password',
+        'warning_condition': lambda x: x == '',
+        'hide': True,
+    },
 }
+
+
+class NamespaceError(StandardError) : pass
+class LoginError(StandardError)     : pass
 
 
 def get_user_input(prompt_options):
@@ -138,6 +178,170 @@ def get_user_input(prompt_options):
         input = get_input(prompt_options['hide'])
 
     return input
+
+def get_namespace(nsinfo, separator):
+    """ Extracts the namespace from the IMAP namspace tuple.  For example, if
+        the IMAP namespace was:
+        ("user", ".")
+        then the namespace of 'user' would be returned.
+    """
+    try:
+        ns = nsinfo.strip('()')
+        ns = ns.replace('" "', '".|."')
+        ns = ns.split('.|.')[0]
+        namespace = ns.strip('"%s' % separator)
+    except (ValueError, IndexError):
+        mesg = "get_namespace(): %s\n" % getTrace()
+        raise NamespaceError, mesg 
+    return namespace
+    
+def get_separator(nsinfo):
+    """ Extracts the separator from the IMAP namspace tuple.  For example, if
+        the IMAP namespace was:
+        ("user", ".")
+        then the separator of '.' would be returned.
+    """
+    try:
+        ns = nsinfo.strip('()')
+        ns = ns.replace('" "', '".|."')
+        ns = ns.split('.|.')[1]
+        separator = ns.strip('"')
+    except (ValueError, IndexError):
+        mesg = "get_separator(): %s\n" % getTrace()
+        raise NamespaceError, mesg 
+    return separator
+    
+def split_ns_category(nses):
+    """ Split a namespace category into individual namespace strings
+
+    Given a namespace category string as such:
+        
+        (("#shared/" "/") ("#public/" "/")("#ftp/" "/"))
+        
+    return a list of namespaces, al la:
+        
+        ['("#shared/" "/")', '("#public/" "/")', '("#ftp/" "/")']
+        
+    Bug: I'm not sure if it's actually allowed in the RFC, but this code 
+    won't handle a namespace that looks liskte the following:
+    (("" "/")("#mh/" "/" "X-PARAM" ("FLAG1" "FLAG2")("FLAG3" "FLAG4")))
+    If someone wants to let me know, then I'll look into fixing it. So far
+    I have not run into an implementation where this is a problem.
+    """
+    cat = nses[1:-1]
+    cat = cat.replace(')(', ')|(')
+    catlist = cat.split('|')
+    return catlist
+
+def split_namespaces(nsstr):
+    """ Split a string of IMAP namespace tuples into a list of python strings.
+    
+    The NAMESPACE command returns a string with 3 namespace sections:
+    personal, other user's, and shared.  Each section may consist of 'NIL',
+    or a list of namespaces.  For all the gory details, read RFC 2342
+    http://www.faqs.org/rfcs/rfc2342.html
+        
+    Some exapmles of the different strings are:
+        (("" "/")) NIL NIL
+        NIL NIL (("" "."))
+        (("" "/")) NIL (("Public Folders/" "/"))
+        (("" "/")) (("~" "/")) (("#shared/" "/") ("#public/" "/")("#ftp/" "/"))
+        (("" "/")("#mh/" "/" "X-PARAM" ("FLAG1" "FLAG2"))) NIL NIL
+        
+    split_namespaces creates a list of each individual namespace.  For 
+    example, using the 4th line above, we would get:
+        ['("" "/")', '("~" "/")', '("#shared/" "/")', '("#public/" "/")',
+         '("#ftp/" "/")']
+    """
+    # OK definitely need to refresh my memory of namspaces and what I was
+    # thinking.  I think function definitely needs some tests.
+    
+    # this is goign to get hairy
+    # rip off first namespace
+    nslist = []
+    s = nsstr
+    # Attack the personal namespace
+    if s.find('NIL') == 0:
+        s = s[4:]
+    elif s.find('((') == 0:
+        nsend = s.find('))') + 2
+        personalns = s[:nsend]
+        nslist.extend(split_ns_category(personalns))
+        s = s[nsend + 1:]
+        pass
+
+    # Now chop off the head of the other user's namespace
+    if s.find('NIL') == 0:
+        s = s[4:]
+    elif s.find('((') == 0:
+        nsend = s.find('))') + 2
+        userns = s[:nsend]
+        nslist.extend(split_ns_category(userns))
+        s = s[nsend + 1:]
+        pass
+    
+    # Finally, kill off the shared namespace
+    if s.find('NIL') < 0:
+        sharedns = s
+        nslist.extend(split_ns_category(sharedns))
+        pass
+    
+    return nslist
+
+def get_ns_info(cnx):
+    """ Query the IMAP server for namespace info.
+
+    Parses the response from the server and return a list of tuples. Each
+    tuple consists of the name of the namespace and the separator for the
+    namespace: ie: ('user', '.')
+
+    """
+    nslist = []
+    result = cnx.namespace()
+    if result[0] != 'OK':
+        raise NamespaceError
+    ns = split_namespaces(result[1][0])
+    for n in ns:
+        separatoy = get_separator(n)
+        namespace = get_namespace(n, separator)
+        yield (namespace, separator)
+    
+
+def imap_login(options):
+    """ Returns a connection to the IMAP server.
+    
+    Connects to and logs into the IMAP server returning the connection for
+    further use.
+
+    At this time it only connects via SSL.  I'll accept patches to allow for
+    insecure IMAP connections.
+
+    """
+   
+    # TODO: How am I goign to handle errors? 
+    cnx = imaplib.IMAP4_SSL(options['imap_server'])
+    cnx.login(options['imap_user'], options['imap_password'])
+    return cnx
+
+
+def get_imap_folder_list(cnx, options):
+    """ Returns an iterable of the list of folders on the IMAP server.
+
+    This only returns folders that are in the INBOX.
+
+    """
+    namespace = separator = ''
+    # TODO: Is there a better way to do this?  get_ns_info() is an iterable
+    # returning tuples containing the namespace and the separator.  I only
+    # care to match the namespace, but once matched, I do need the
+    # corresponding separator
+    for ns in get_ns_info(cnx):
+        if 'INBOX' in ns:
+            namespace, separator = ns
+            break
+        continue
+    
+    yield folder
         
 
 
@@ -149,10 +353,6 @@ def main(args):
 
     rc = 0
     if args['genconfig']:
-        # Ask for IMAP server
-        # Ask for IMAP username
-        # Ask for IMAP Password
-        # Ask for name of output config file [config.json]
         # Ask for name of IMAP folder to place migrated emails
         # Print list of folders
         # Ask for list of excluded folders. [Drafts, Sent, Trash]
@@ -164,12 +364,16 @@ def main(args):
         options['imap_user'] = get_user_input(INPUT['imap_user']) 
         options['imap_password'] = get_user_input(INPUT['imap_password']) 
         options['config_path'] = get_user_input(INPUT['config_path']) 
+        folder_list = get_imap_folder_list(options)
+        print_imap_folder_list(folder_list)
         options['folder_list'] = get_user_input(INPUT['folder_list']) 
         options['gmail_email'] = get_user_input(INPUT['gmail_email']) 
         import pprint
         pprint.pprint(options)
     elif args['migrate']:
         print('TODO: migrate data')
+        options['gmail_amdin'] = get_user_input(INPUT['gmail_admin']) 
+        options['gmail_password'] = get_user_input(INPUT['gmail_password']) 
         # Perform migration work here
         # Load config file
         # Log into IMAP
