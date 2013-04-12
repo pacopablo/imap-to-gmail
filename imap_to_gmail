@@ -23,12 +23,17 @@ migration.  Edit the resulting config file (config.json) and then pass it to
 `imap_to_gmail migrate` to move mail from IMAP to Gmail
 """[1:-1]
 
+# Yeah, lazy crappy debugging
+DEBUG = True
+
 # Standard Library Imports
 import sys
 import imaplib
 import getpass
 import json
 import socket
+import os
+import traceback
 from pprint import pprint
 
 # Third Party Imports
@@ -39,6 +44,11 @@ VERSION='0.1.0'
 
 RESPONSE = 0
 DATA = 1
+
+DEFAULT_EXCLUDED_FOLDERS = [
+    'junk',
+    'trash',
+]
 
 INPUT = {
     'imap_user' : {
@@ -79,6 +89,20 @@ be populated and will need to be done manually."""[1:],
         'hide': True,
     }, 
 
+    'imap_migrated_dest' : {
+        'info': """
+Please specify a folder on the IMAP server where emails that have been
+migrated can be placed.  If the folder exists already, it will be excluded from
+the migration.  Additionally, emails that can not be successfully migrated
+will be places in a "Failures" subfolder of the folder specified."""[1:],
+        'prompt': 'IMAP folder for migrated emails',
+        'warning': """
+Without the IMAP folder, in which to place migrated emails, the migration will
+not proceed."""[1:],
+        'warning_condition': lambda x: x == '',
+        'hide': False,
+    },
+
     'config_path' : {
         'info': """
 Enter the filename to which the configuration should be saved. If a filename
@@ -94,11 +118,10 @@ current directory.
     'folder_list' : {
         'info': """
 Specify the list of folders to exclude from migration as a comma separated
-list. Leading and trailing spaces betwen entries will be stripped.  By
-default, the following folders will not be migrated if the exist:
+list. Leading and trailing spaces between entries will be stripped.  By
+default, the following folders will not be migrated if they exist:
 
-Junk
-Trash
+{}
 
 If you want to include all folders, specify "-" as the list.  An empty 
 list will migrate all but the default excluded folders."""[1:],
@@ -143,6 +166,28 @@ migration API."""[1:],
 
 class NamespaceError(StandardError) : pass
 class LoginError(StandardError)     : pass
+class DieInAFireError(StandardError):
+    """ Error from which the only option it to abort the program
+
+    There are some errors such that the only real option is to simply quit the
+    program and the user may restart the program to try again.  Some examples
+    of this are a user mis-typing the IMAP server name twice, failure to
+    authenticate to the TMAP server, etc.
+
+    """
+    pass
+
+
+def getTrace():
+    """ retrieve and format an exception into a nice message
+    """
+    msg = traceback.format_exception(sys.exc_info()[0], sys.exc_info()[1],
+        sys.exc_info()[2])
+    msg = ''.join(msg)
+    msg = msg.split('\012')
+    msg = '\n'.join(msg)
+    msg += '\n'
+    return msg
 
 
 def get_user_input(prompt_options):
@@ -185,7 +230,7 @@ def get_user_input(prompt_options):
     return input
 
 
-def get_namespace(nsinfo, separator):
+def parse_namespace(nsinfo, separator):
     """ Extracts the namespace from the IMAP namspace tuple.
 
     For example, if the IMAP namespace was:
@@ -205,7 +250,7 @@ def get_namespace(nsinfo, separator):
     return namespace
 
     
-def get_separator(nsinfo):
+def parse_separator(nsinfo):
     """ Extracts the separator from the IMAP namspace tuple.
 
     For example, if the IMAP namespace was:
@@ -223,7 +268,8 @@ def get_separator(nsinfo):
     except (ValueError, IndexError):
         raise NamespaceError
     return separator
-    
+
+
 def split_ns_category(nses):
     """ Split a namespace category into individual namespace strings
 
@@ -245,6 +291,7 @@ def split_ns_category(nses):
     cat = cat.replace(')(', ')|(')
     catlist = cat.split('|')
     return catlist
+
 
 def split_namespaces(nsstr):
     """ Split a string of IMAP namespace tuples into a list of python strings.
@@ -301,6 +348,7 @@ def split_namespaces(nsstr):
     
     return nslist
 
+
 def get_ns_info(cnx):
     """ Query the IMAP server for namespace info.
 
@@ -315,8 +363,8 @@ def get_ns_info(cnx):
         raise NamespaceError
     ns = split_namespaces(result[1][0])
     for n in ns:
-        separator = get_separator(n)
-        namespace = get_namespace(n, separator)
+        separator = parse_separator(n)
+        namespace = parse_namespace(n, separator)
         yield (namespace, separator)
     
 
@@ -331,30 +379,50 @@ def imap_login(options):
 
     """
    
-    # TODO: How am I goign to handle errors? 
-    cnx = None
+    # Note: I don't really like this method of handling errors.  It makes the
+    # method uncomfortably long and repetitious.  Perhaps this is just how
+    # it's to be done.  Instead of re-trying input once on a failed attempt,
+    # the try/except block could be put into a loop.  I don't know that I
+    # want to constantly ask the user to try again.  I'm open to other options
+    # for handling errors.
+    options['imap_server'] = get_user_input(INPUT['imap_server'])
     try:
-        options['imap_server'] = get_user_input(INPUT['imap_server'])
         cnx = imaplib.IMAP4_SSL(options['imap_server'])
     except socket.gaierror:
-        print("Unable to connect to the server specified")
+        print("Unable to connect to the server specified.  Please verify that")
+        print("the server name was typed correctly.\n")
+        options['imap_server'] = get_user_input(INPUT['imap_server'])
+        try:
+            cnx = imaplib.IMAP4_SSL(options['imap_server'])
+        except socket.gaierror, e:
+            message = e.strerror
+            if e.errno == 8:
+                message = "Unable to resolve given hostname"
+            raise DieInAFireError(message)
+        except socket.error, e:
+            raise DieInAFireError(e.strerror)
 
+    options['imap_user'] = get_user_input(INPUT['imap_user'])
+    options['imap_password'] = get_user_input(INPUT['imap_password'])
     try:
-        options['imap_user'] = get_user_input(INPUT['imap_user']) 
-        options['imap_password'] = get_user_input(INPUT['imap_password']) 
         cnx.login(options['imap_user'], options['imap_password'])
     except imaplib.IMAP4.error:
-        print("Unable to log into server")
-        
+        print("Unable to log into server.  Please verify that the username ")
+        print("and password are correct.\n")
+        options['imap_user'] = get_user_input(INPUT['imap_user'])
+        options['imap_password'] = get_user_input(INPUT['imap_password'])
+        try:
+            cnx.login(options['imap_user'], options['imap_password'])
+        except imaplib.IMAP4.error, e:
+            raise DieInAFireError(e.message)
     return cnx
 
 
-def get_imap_folder_list(cnx, options):
-    """ Returns an iterable of the list of folders on the IMAP server.
-
-    This only returns folders that are in the INBOX.
+def get_inbox_ns(cnx):
+    """ Return the namespace info for INBOX if it exists
 
     """
+
     namespace = separator = ''
     # TODO: Is there a better way to do this?  get_ns_info() is an iterable
     # returning tuples containing the namespace and the separator.  I only
@@ -365,16 +433,131 @@ def get_imap_folder_list(cnx, options):
             namespace, separator = ns
             break
         continue
-    
+    return (namespace, separator)
+
+
+def get_imap_folder_list(cnx):
+    """ Returns an iterable of the list of folders on the IMAP server.
+
+    This only returns folders that are in the INBOX.
+
+    """
+    namespace, _ = get_inbox_ns(cnx)
     for folder_str in cnx.list(namespace)[DATA]:
         i = folder_str.find(namespace)
         folder = folder_str[i:]
         folder = folder[:folder.find('"')]
         yield folder
-   
-def print_imap_folder_list(folder_list):
-    print(folder_list) 
 
+
+def get_excluded_folder_list(cnx):
+    """ Get the list of excluded folders from the user.
+
+    Displays a list of folders on the IMAP server and gets a list of folders
+    to exclude from the migration.  Validates excluded folders against the list
+    of actual folders
+
+    """
+    global INPUT, DEFAULT_EXCLUDED_FOLDERS
+
+    separator = get_inbox_ns(cnx)[1]
+    folders = []
+    excluded_folders = []
+    for f in get_imap_folder_list(cnx):
+        parts = f.split(separator)
+        if parts[-1].lower() in DEFAULT_EXCLUDED_FOLDERS:
+            excluded_folders.append(f)
+        else:
+            folders.append(f)
+        continue
+
+    indent = " " * 4
+    print("The following folders were found in the IMAP mailbox:\n\n")
+    print(indent + ('\n' + indent).join(folders))
+    INPUT['folder_list']['info']= INPUT['folder_list']['info'].format(
+                                            '\n'.join(excluded_folders))
+    user_folders = get_user_input(INPUT['folder_list'])
+
+    if user_folders == '-':
+        excluded_folders.extend(folders)
+    elif user_folders:
+        # TODO: Clean this up.  There has to be a better algorithm
+        # The goal is to add the list of folders specified by the user that
+        # match actual folders in the IMAP server to the excluded list.  The
+        # match should be case-insensitive, and the string added to the
+        # excluded list should be that pulled from the IMAP server
+        orphans = []
+        for f in user_folders.split(','):
+            for imap_folder in folders:
+                if f.lower() == imap_folder.lower():
+                    excluded_folders.append(imap_folder)
+                    break
+            else:
+                orphans.append(f)
+            continue
+
+        if orphans:
+            print("The following folders were not found in the list of existing")
+            print("folders.  Please add them manually if desired")
+            print("\n" + indent + ('\n' + indent).join(orphans))
+
+    return excluded_folders
+
+
+def get_migrated_dest_folder(cnx):
+    """ Get the IMAP folder where migrated emails should be stored
+
+    """
+    global INPUT
+
+    dest = get_user_input(INPUT['imap_migrated_dest'])
+    if not dest:
+        raise DieInAFireError('An IMAP where migrated emails are to be stored'
+                              ' is required.')
+    namespace, separator = get_inbox_ns(cnx)
+    if not dest.lower().startswith(namespace.lower() + separator):
+        dest = namespace + separator + dest
+    return dest
+
+
+def get_config_path():
+    """ Return the full path for the config file
+
+    Prompts the user for the path where the config should be stored.  If no
+    path is given, it defaults to `config.json` in the working directory
+
+    """
+
+    path = get_user_input(INPUT['config_path'])
+    if not path:
+        path = 'config.json'
+    abspath = os.path.abspath(path)
+    if os.path.isfile(abspath):
+        choice = raw_input("The file {} already exists.  Are you sure you want "
+                           "to overwrite it? [y/n] ==> ".format(path))
+        if not choice.lower() in ['y', 'yes']:
+            raise DieInAFireError('Will not overwrite the config file.')
+        try:
+            config = open(abspath, 'wb')
+            config.close()
+        except IOError, e:
+            raise DieInAFireError('Unable to save config file:\n' + e.strerror)
+    elif os.path.exists(abspath):
+        raise DieInAFireError('The path specified is not a file.  Please '
+                              'chose another path')
+    return abspath
+
+
+def load_config(path):
+    """ Load the config at the give path
+
+    If the path is empty or None, look for the config in the working directory
+    in the file named `config.json`
+
+    """
+    if not path:
+        path = 'config.json'
+    return json.load(open(path, 'rb'))
 
 def main(args):
     """ Migrate email from IMAP to Gmail
@@ -383,37 +566,59 @@ def main(args):
     global USAGE, INPUT
 
     rc = 0
-    if args['genconfig']:
-        # Ask for name of IMAP folder to place migrated emails
-        # Print list of folders
-        # Ask for list of excluded folders. [Drafts, Sent, Trash]
-        # Ask for Gmail email address
-        # Ask for Gmail Admin email address
-        # Write out config file
-        options = {}
-        cnx = imap_login(options)
-        folder_list = [folder for folder in get_imap_folder_list(cnx, options)]
-        print_imap_folder_list(get_imap_folder_list(cnx, options))
-        options['folder_list'] = get_user_input(INPUT['folder_list']) 
-        options['gmail_email'] = get_user_input(INPUT['gmail_email']) 
-        options['config_path'] = get_user_input(INPUT['config_path']) 
-    elif args['migrate']:
-        print('TODO: migrate data')
-        options['gmail_amdin'] = get_user_input(INPUT['gmail_admin']) 
-        options['gmail_password'] = get_user_input(INPUT['gmail_password']) 
-        # Perform migration work here
-        # Load config file
-        # Log into IMAP
-        # Migrate email to Gmail
-        #   Move read email to INBOX and/or corresponding folder
-        #   Move unread email in INBOX to 'Migrated/Unread'
-        #   Move unread email in folder to corresponding folder
-        # Move mail to "done" IMAP folder
-        # If a message fails, move to "done/failed" IMAP folder
-    else:
-        print(USAGE)
+    options = {}
+    try:
+        if args['genconfig']:
+            # Ask for name of IMAP folder to place migrated emails
+            # Print list of folders
+            # Ask for list of excluded folders. [Sent, Trash]
+            # Ask for Gmail email address
+            # Write out config file
+            cnx = imap_login(options)
+            options['folder_list'] = get_excluded_folder_list(cnx)
+            options['imap_migrated_dest'] = get_migrated_dest_folder(cnx)
+            options['gmail_email'] = get_user_input(INPUT['gmail_email'])
+            options['config_path'] = get_config_path()
+            del options['imap_password']
+            open(options['config_path'], 'wb').write(
+                        json.dumps(options,indent=4, separators=(',', ': ')))
+        elif args['migrate']:
+            # Load config file
+            options = load_config(args['--config'])
+            # TODO: This should really be done a nicer way.  Should probably
+            # use get_user_input in some manner
+            print ("Logging into the IMAP server as user: {}".format(
+                                                        options['imap_user']))
+            options['imap_password'] = getpass.getpass('IMAP Password ==> ')
+
+
+            # Ask for Gmail Admin email address
+            # Ask for gmail admin password
+
+            print('TODO: migrate data')
+            options['gmail_amdin'] = get_user_input(INPUT['gmail_admin'])
+            options['gmail_password'] = get_user_input(INPUT['gmail_password'])
+            # Perform migration work here
+            # Load config file
+            # Log into IMAP
+            # Migrate email to Gmail
+            #   Move read email to INBOX and/or corresponding folder
+            #   Move unread email in INBOX to 'Migrated/Unread'
+            #   Move unread email in folder to corresponding folder
+            # Move mail to "done" IMAP folder
+            # If a message fails, move to "done/failed" IMAP folder
+        else:
+            print(USAGE)
+            rc = 1
+    except DieInAFireError, e:
+        print('Unable to continue due to non-recoverable error:\n\n')
+        print(e.args[0])
+        if DEBUG:
+            print(getTrace())
         rc = 1
+
     return rc
+
 
 if __name__ == '__main__':
     rc = 0
