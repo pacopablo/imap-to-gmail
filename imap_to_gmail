@@ -33,17 +33,25 @@ import getpass
 import json
 import socket
 import os
+import re
+import time
 import traceback
 from pprint import pprint
 
 # Third Party Imports
 from gdata.apps.migration import service
+from gdata.service import BadAuthentication
 from docopt import docopt
+from progressbar import Bar, Counter, Percentage, ProgressBar, Timer
+
 
 VERSION='0.1.0'
 
 RESPONSE = 0
 DATA = 1
+
+MESSAGE_IDS_RE = re.compile(
+            r'\d+\s+\(FLAGS\s+\((?P<flags>.*)\)\s+UID\s+(?P<uid>\d+)\)$')
 
 DEFAULT_EXCLUDED_FOLDERS = [
     'junk',
@@ -146,7 +154,7 @@ the configuration file before email can be migrated."""[1:],
 Enter the email address of a Gmail domain administrator that has access to the
 migration API.  If the domain administrator has enabled access to the
 migration API for users, then this can be the same as the Gmail email above."""[1:],
-        'prompt': 'Gmail admin email address',
+        'prompt': 'Gmail administrator',
         'warning': """
 Migration can not continue without specifying an account with access to the
 migration API."""[1:],
@@ -158,6 +166,40 @@ migration API."""[1:],
         'info': 'Enter the password for the Gmail admin account',
         'prompt': 'Gmail admin account password',
         'warning': 'Migration can not continue without the password',
+        'warning_condition': lambda x: x == '',
+        'hide': True,
+    },
+
+    'imap_migrate_user' : {
+        'info': """
+A username was not found in the config file.  Please specify the user name to
+use when logging into the IMAP server."""[1:],
+        'prompt': 'IMAP username',
+        'warning': """
+Email migration can not continue without a user from which the email should
+be migrated."""[1:],
+        'warning_condition': lambda x: x == '',
+        'hide': False,
+    },
+
+    'imap_migrate_server' : {
+        'info': """
+An IMAP server was not specified in the config file.  Please enter the
+hostname or IP address of the IMAP server."""[1:],
+        'prompt': 'IMAP server',
+        'warning': """
+Email migration can not continue without a server from which the email should
+be migrated."""[1:],
+        'warning_condition': lambda x: x == '',
+        'hide': False,
+    },
+
+    'imap_migrate_password' : {
+        'info': """
+Please enter the password for the IMAP user."""[1:],
+        'prompt': 'IMAP password',
+        'warning': """
+A password is required to continue."""[1:],
         'warning_condition': lambda x: x == '',
         'hide': True,
     },
@@ -368,14 +410,20 @@ def get_ns_info(cnx):
         yield (namespace, separator)
     
 
-def imap_login(options):
-    """ Returns a connection to the IMAP server.
-    
-    Connects to and logs into the IMAP server returning the connection for
-    further use.
+def imap_login(server_prompt, user_prompt, password_prompt, options=None):
+    """ Returns a connection to the IMAP server and config information
+
+    Expects three prompts to pass to the `get_user_info` method.
+
+    Prompts the user for the IMAP server, username, and password information
+    and then connects to and logs into the IMAP server returning the
+    connection for further use.
 
     At this time it only connects via SSL.  I'll accept patches to allow for
     insecure IMAP connections.
+
+    The server name, username and password are returned as a dicitonary
+    containing: 'imap_user', 'imap_password', and 'imap_server' keys
 
     """
    
@@ -385,13 +433,17 @@ def imap_login(options):
     # the try/except block could be put into a loop.  I don't know that I
     # want to constantly ask the user to try again.  I'm open to other options
     # for handling errors.
-    options['imap_server'] = get_user_input(INPUT['imap_server'])
+    if options is None:
+        options = {}
+    imap_server = options.get('imap_server', None)
+    options['imap_server'] = imap_server if imap_server else \
+                                                 get_user_input(server_prompt)
     try:
         cnx = imaplib.IMAP4_SSL(options['imap_server'])
     except socket.gaierror:
         print("Unable to connect to the server specified.  Please verify that")
         print("the server name was typed correctly.\n")
-        options['imap_server'] = get_user_input(INPUT['imap_server'])
+        options['imap_server'] = get_user_input(server_prompt)
         try:
             cnx = imaplib.IMAP4_SSL(options['imap_server'])
         except socket.gaierror, e:
@@ -402,20 +454,22 @@ def imap_login(options):
         except socket.error, e:
             raise DieInAFireError(e.strerror)
 
-    options['imap_user'] = get_user_input(INPUT['imap_user'])
-    options['imap_password'] = get_user_input(INPUT['imap_password'])
+    imap_user = options.get('imap_user', None)
+    options['imap_user'] = imap_user if imap_user else \
+                                                    get_user_input(user_prompt)
+    options['imap_password'] = get_user_input(password_prompt)
     try:
         cnx.login(options['imap_user'], options['imap_password'])
     except imaplib.IMAP4.error:
         print("Unable to log into server.  Please verify that the username ")
         print("and password are correct.\n")
-        options['imap_user'] = get_user_input(INPUT['imap_user'])
-        options['imap_password'] = get_user_input(INPUT['imap_password'])
+        options['imap_user'] = get_user_input(user_prompt)
+        options['imap_password'] = get_user_input(password_prompt)
         try:
             cnx.login(options['imap_user'], options['imap_password'])
         except imaplib.IMAP4.error, e:
             raise DieInAFireError(e.message)
-    return cnx
+    return cnx, options
 
 
 def get_inbox_ns(cnx):
@@ -559,6 +613,125 @@ def load_config(path):
         path = 'config.json'
     return json.load(open(path, 'rb'))
 
+
+def google_login(options):
+    """ Log into the Google migration API
+
+    """
+
+    gmail_email = options.get('gmail_email', None)
+    options['gmail_email'] = gmail_email if gmail_email else \
+                                         get_user_input(INPUT['gmail_email'])
+    try:
+        user, domain = options['gmail_email'].split('@')
+    except ValueError:
+        raise DieInAFireError('Unable to extract the username and domain '
+                              'from\nthe gmail email address provided: ' +
+                              options['gmail_email'])
+    options['gmail_admin'] = get_user_input(INPUT['gmail_admin'])
+    options['gmail_password'] = get_user_input(INPUT['gmail_password'])
+    srv = service.MigrationService(email=options['gmail_admin'],
+                                   password=options['gmail_password'],
+                                   domain=domain,
+                                   source='imap-to-gmail')
+    try:
+        srv.ProgrammaticLogin()
+    except BadAuthentication, e:
+        raise DieInAFireError('Unable to authenticate to Google: ' + e.message)
+    return srv
+
+
+def prepare_imap_folders(cnx, folder):
+    """ Prepare the "migrated" folder on the IMAP server """
+
+    success_folder = options['imap_migrated_dest']
+    if 'NO' == cnx.select(folder)[RESPONSE]:
+        resp = cnx.create(folder)
+        if 'NO' == resp[RESPONSE]:
+            raise DieInAFireError('Unable to prepare IMAP folder {0}.\n'
+                                  'Reason:\n{1}\n'.format(folder,
+                                                          resp[DATA][0]))
+
+
+def get_message_ids(cnx):
+    """ Returns a generator of (UID, FLAGS) tuples for the currently selected
+    mailbox
+
+    """
+    global MESSAGE_IDS_RE
+
+    resp = cnx.fetch('1:*', '(UID FLAGS)')
+    if 'OK' == resp[RESPONSE]:
+        for data in resp[DATA]:
+            # Example: '1 (FLAGS (\\Seen) UID 1)'
+            # Even though it may now have two problems, this is screams regex
+            parts = MESSAGE_IDS_RE.match(data).groupdict()
+            flags = parts['flags'].split(' ')
+            yield (parts['uid'], flags)
+    else:
+        raise StopIteration
+
+
+def folder_is_excluded(excluded_folders, folder):
+    """ Return whether or not the folder is excluded.
+
+    A folder is excluded if it is in the `excluded_folders` list or is a child
+    of a folder in the `excluded_folders` list
+
+    """
+
+    # is there a more pythonic / easier way to do this?
+    excluded = False
+    for f in excluded_folders:
+        if folder.startswith(f):
+            excluded = True
+            break
+    return excluded
+
+
+def migrate_email(imap_cnx, google_cnx, options):
+    """ Move email from IMAP to Gmail """
+
+    _, separator = get_inbox_ns(imap_cnx)
+    widgets = ['Processed: ', Counter(), ' emails (', Timer(), ')  ',
+               Percentage(), Bar()]
+    pbar = ProgressBar(widgets=widgets)
+    options['folder_list'].append(options['imap_migrated_dest'])
+    for folder in get_imap_folder_list(imap_cnx):
+        if not folder_is_excluded(options['folder_list'], folder):
+            print("Migrating folder: {}".format(folder))
+            migrated_folder = separator.join([options['imap_migrated_dest']] +
+                                              folder.split(separator)[1:])
+            prepare_imap_folders(imap_cnx, migrated_folder)
+            resp = imap_cnx.select(folder)
+            if 'OK' == resp[RESPONSE]:
+                num_emails = int(resp[DATA][0])
+                if 0 == num_emails:
+                    print('{} empty. Skipping ...'.format(folder))
+                else:
+                    pbar.maxval = int(resp[DATA][0])
+                    pbar.start()
+                    i = 0
+                    for uid, flags in get_message_ids(imap_cnx):
+                        i += 1
+                        mail = imap_cnx.uid('fetch', uid, 'RFC822')
+                        user, domain = options['gmail_email'].split('@')
+                        properties, labels = parse_flags(folder, flags)
+
+                        # srv.ImportMail(user_name=user,
+                        #                mail_message=mail[DATA][0][1],
+                        #                mail_item_properties=['IS_UNREAD',],
+                        # mail_labels=['Migrated'])
+                        # time.sleep(0.01)
+                        pbar.update(i)
+                    pbar.finish()
+            else:
+                print("Error converting folder: {}".format(resp[DATA][0]))
+
+
+    pass
+
+
 def main(args):
     """ Migrate email from IMAP to Gmail
 
@@ -574,7 +747,10 @@ def main(args):
             # Ask for list of excluded folders. [Sent, Trash]
             # Ask for Gmail email address
             # Write out config file
-            cnx = imap_login(options)
+            cnx, imap_info = imap_login(INPUT['imap_server'],
+                                        INPUT['imap_user'],
+                                        INPUT['imap_password'])
+            options.update(imap_info)
             options['folder_list'] = get_excluded_folder_list(cnx)
             options['imap_migrated_dest'] = get_migrated_dest_folder(cnx)
             options['gmail_email'] = get_user_input(INPUT['gmail_email'])
@@ -585,22 +761,21 @@ def main(args):
         elif args['migrate']:
             # Load config file
             options = load_config(args['--config'])
-            # TODO: This should really be done a nicer way.  Should probably
-            # use get_user_input in some manner
-            print ("Logging into the IMAP server as user: {}".format(
-                                                        options['imap_user']))
-            options['imap_password'] = getpass.getpass('IMAP Password ==> ')
-
-
-            # Ask for Gmail Admin email address
-            # Ask for gmail admin password
-
-            print('TODO: migrate data')
-            options['gmail_amdin'] = get_user_input(INPUT['gmail_admin'])
-            options['gmail_password'] = get_user_input(INPUT['gmail_password'])
-            # Perform migration work here
-            # Load config file
+            pprint(options)
             # Log into IMAP
+            cnx, _ = imap_login(INPUT['imap_migrate_server'],
+                            INPUT['imap_migrate_user'],
+                            INPUT['imap_migrate_password'],
+                            options)
+            # Log into Google Migration API
+            gsrv = google_login(options)
+            # prep migration "done" IMAP folder
+            prepare_imap_folders(cnx, options['imap_migrated_dest'])
+            _, separator = get_inbox_ns(cnx)
+            prepare_imap_folders(cnx, options['imap_migrated_dest'] +
+                                      separator + 'Failures')
+            # Perform migration work here
+            migrate_email(cnx, gsrv, options)
             # Migrate email to Gmail
             #   Move read email to INBOX and/or corresponding folder
             #   Move unread email in INBOX to 'Migrated/Unread'
