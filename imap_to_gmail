@@ -37,10 +37,12 @@ import re
 import time
 import traceback
 from pprint import pprint
+from itertools import izip_longest
 
 # Third Party Imports
 from gdata.apps.migration import service
 from gdata.service import BadAuthentication
+import gdata.apps.emailsettings.client as gsettings
 from docopt import docopt
 from progressbar import Bar, Counter, Percentage, ProgressBar, Timer
 
@@ -230,6 +232,11 @@ def getTrace():
     msg = '\n'.join(msg)
     msg += '\n'
     return msg
+
+
+def chunker(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return izip_longest(*args, fillvalue=fillvalue)
 
 
 def get_user_input(prompt_options):
@@ -615,7 +622,7 @@ def load_config(path):
 
 
 def google_login(options):
-    """ Log into the Google migration API
+    """ Log into the Google migration and email settings APIs
 
     """
 
@@ -634,23 +641,34 @@ def google_login(options):
                                    password=options['gmail_password'],
                                    domain=domain,
                                    source='imap-to-gmail')
+    settings = gsettings.EmailSettingsClient(domain=domain)
+
     try:
         srv.ProgrammaticLogin()
+        settings.ClientLogin(email=options['gmail_admin'],
+                             password=options['gmail_password'],
+                             source='imap-to-gmail')
+
     except BadAuthentication, e:
         raise DieInAFireError('Unable to authenticate to Google: ' + e.message)
-    return srv
+    return (srv, settings)
 
 
 def prepare_imap_folders(cnx, folder):
     """ Prepare the "migrated" folder on the IMAP server """
 
-    success_folder = options['imap_migrated_dest']
+    #cnx.debug = 5
+    # Python IMAP bug: when passed unicode strings the select method (possibly
+    # others?) doesn't quote the string.  This means that things go kablooey
+    # if your folders have spaces in them.
+    folder = str(folder)
     if 'NO' == cnx.select(folder)[RESPONSE]:
         resp = cnx.create(folder)
         if 'NO' == resp[RESPONSE]:
             raise DieInAFireError('Unable to prepare IMAP folder {0}.\n'
                                   'Reason:\n{1}\n'.format(folder,
                                                           resp[DATA][0]))
+    #cnx.debug = 0
 
 
 def get_message_ids(cnx):
@@ -672,6 +690,19 @@ def get_message_ids(cnx):
         raise StopIteration
 
 
+def get_messages(cnx, chunksize):
+    """ Generator that returns tuples of (flags, message).
+
+    chunksize is the number of messages to download from the IMAP server in one
+    fetch command.
+
+    """
+
+    uids_and_flags = [t for t in get_message_ids(cnx)]
+    uids_and_flags.sort()
+
+
+
 def folder_is_excluded(excluded_folders, folder):
     """ Return whether or not the folder is excluded.
 
@@ -680,18 +711,110 @@ def folder_is_excluded(excluded_folders, folder):
 
     """
 
-    # is there a more pythonic / easier way to do this?
-    excluded = False
-    for f in excluded_folders:
-        if folder.startswith(f):
-            excluded = True
-            break
+    if folder in excluded_folders:
+        excluded = True
+    else:
+        # is there a more pythonic / easier way to do this?
+        excluded = False
+        for f in excluded_folders:
+            # We don't want to match children of INBOX since all folders are
+            # children of INBOX
+            if folder.startswith(f) and 'INBOX' != f:
+                excluded = True
+                break
+
     return excluded
 
 
-def migrate_email(imap_cnx, google_cnx, options):
+def parse_flags(folder, flags, sep):
+    """ Parse IMAP flags to Gmail properties and tags
+
+    Property mappings:
+
+    IS_DRAFT:   email located in INBOX.Drafts
+    IS_INBOX:   email located in INBOX
+    IS_SENT:    email located in INBOX.Sent
+    IS_UNREAD:  email with out the \Seen IMAP flag
+    IS_STARRED: email with the \Flagged IMAP flag
+    IS_TRASH:   email in INBOX.Trash, if it was selected for migration
+
+    Flags:
+
+    $Label1:  Important
+    $Label2:  Work
+    $Label3:  Personal
+    $Label4:  To Do
+    $Label5:  Later
+
+    Any flag without a leading \ or $ is translated directly to a label
+
+    """
+
+    PRE_DEFINED_LABELS = {
+        '$Label1': 'Important',
+        '$Label2': 'Work',
+        '$Label3': 'Personal',
+        '$Label4': 'To Do',
+        '$Label5': 'Later',
+    }
+
+
+    properties = []
+    labels = []
+    seen = False
+    if folder.lower() == 'inbox':
+        properties.append('IS_INBOX')
+    elif folder.lower().startswith('inbox' + sep + 'drafts'):
+        properties.append('IS_DRAFT')
+    elif folder.lower().startswith('inbox' + sep + 'sent'):
+        properties.append('IS_SENT')
+    elif folder.lower().startswith('inbox' + sep + 'trash'):
+        properties.append('IS_TRASH')
+
+    for f in flags:
+        if f.startswith('$'):
+            glabel = PRE_DEFINED_LABELS.get(f, None)
+            if glabel:
+                labels.append(glabel)
+        elif f.startswith('\\'):
+            if '\\Flagged' == f:
+                properties.append('IS_STARRED')
+        else:
+            if f:
+                labels.append(f)
+        continue
+
+    if not seen:
+        properties.append('IS_UNREAD')
+        if folder.lower() == 'inbox':
+            labels.append('IMAP Migration')
+
+    return (properties, labels)
+
+
+def create_folder(folder, sep, gset_cnx, user):
+    """ Create the IMAP folder structure using Gmail labels
+
+    """
+    FORBIDDEN_LABELS = ['archive', 'unread', 'drafts', 'sent', 'char',
+                        'muted', 'spam', 'trash', 'popped', 'contactcsv']
+    folder_base = ''
+    for i, p in enumerate(folder.split(sep)[1:]):
+        if i == 0 and p.lower() in FORBIDDEN_LABELS:
+            p = '_' + p
+        folder_base += p
+        gset_cnx.CreateLabel(username=user, name=folder_base)
+        # noinspection PyUnusedLocal
+        folder_base += '/'
+        continue
+
+    return [folder_base.rstrip('/')]
+
+
+def migrate_email(imap_cnx, gsrv_cnx, gset_cnx, options):
     """ Move email from IMAP to Gmail """
 
+    MESSAGE_SET_SIZE = 50
     _, separator = get_inbox_ns(imap_cnx)
     widgets = ['Processed: ', Counter(), ' emails (', Timer(), ')  ',
                Percentage(), Bar()]
@@ -703,31 +826,33 @@ def migrate_email(imap_cnx, google_cnx, options):
             migrated_folder = separator.join([options['imap_migrated_dest']] +
                                               folder.split(separator)[1:])
             prepare_imap_folders(imap_cnx, migrated_folder)
-            resp = imap_cnx.select(folder)
+            # See Python IMAP bug referenced in `prepare_imap_folders`
+            resp = imap_cnx.select(str(folder))
             if 'OK' == resp[RESPONSE]:
                 num_emails = int(resp[DATA][0])
                 if 0 == num_emails:
                     print('{} empty. Skipping ...'.format(folder))
                 else:
-                    pbar.maxval = int(resp[DATA][0])
+                    pbar.maxval = num_emails
                     pbar.start()
                     i = 0
-                    for uid, flags in get_message_ids(imap_cnx):
+                    for uid, flags, msg in get_messages(imap_cnx, MESSAGE_SET_SIZE):
                         i += 1
                         mail = imap_cnx.uid('fetch', uid, 'RFC822')
                         user, domain = options['gmail_email'].split('@')
-                        properties, labels = parse_flags(folder, flags)
-
-                        # srv.ImportMail(user_name=user,
-                        #                mail_message=mail[DATA][0][1],
-                        #                mail_item_properties=['IS_UNREAD',],
-                        # mail_labels=['Migrated'])
-                        # time.sleep(0.01)
+                        properties, labels = parse_flags(folder, flags, separator)
+                        labels += create_folder(folder, separator, gset_cnx,
+                                                user)
+                        gsrv_cnx.ImportMail(user_name=user,
+                                        mail_message=mail[DATA][0][1],
+                                        mail_item_properties=properties,
+                                        mail_labels=labels)
+                        if not '\\Seen' in flags:
+                            imap_cnx.uid('store', uid, '-FLAGS', '(\\Seen)')
                         pbar.update(i)
                     pbar.finish()
             else:
                 print("Error converting folder: {}".format(resp[DATA][0]))
-
 
     pass
 
@@ -759,6 +884,7 @@ def main(args):
             open(options['config_path'], 'wb').write(
                         json.dumps(options,indent=4, separators=(',', ': ')))
         elif args['migrate']:
+            cnx.debug = 5
             # Load config file
             options = load_config(args['--config'])
             pprint(options)
@@ -767,15 +893,15 @@ def main(args):
                             INPUT['imap_migrate_user'],
                             INPUT['imap_migrate_password'],
                             options)
-            # Log into Google Migration API
-            gsrv = google_login(options)
+            # Log into Google Migration and Email Settings APIs
+            gsrv, gset = google_login(options)
             # prep migration "done" IMAP folder
             prepare_imap_folders(cnx, options['imap_migrated_dest'])
             _, separator = get_inbox_ns(cnx)
             prepare_imap_folders(cnx, options['imap_migrated_dest'] +
                                       separator + 'Failures')
             # Perform migration work here
-            migrate_email(cnx, gsrv, options)
+            migrate_email(cnx, gsrv, gset, options)
             # Migrate email to Gmail
             #   Move read email to INBOX and/or corresponding folder
             #   Move unread email in INBOX to 'Migrated/Unread'
@@ -797,9 +923,12 @@ def main(args):
 
 if __name__ == '__main__':
     rc = 0
-    args = docopt(USAGE, help=True,
-                  version='IMAP to Gmail Migration Tool {0}'.format(VERSION))
-    rc = main(args)
+    stderr_file = open('imap_to_gmail.log', 'a+b')
+    sys.stderr = stderr_file
+    try:
+        args = docopt(USAGE, help=True,
+                      version='IMAP to Gmail Migration Tool {0}'.format(VERSION))
+        rc = main(args)
+    finally:
+        stderr_file.close()
     sys.exit(rc)
-
-    
