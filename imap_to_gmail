@@ -46,6 +46,7 @@ import gdata.apps.emailsettings.client as gsettings
 from docopt import docopt
 from progressbar import Bar, Counter, Percentage, ProgressBar, Timer
 
+DEBUG=1
 
 VERSION='0.1.0'
 
@@ -234,9 +235,11 @@ def getTrace():
     return msg
 
 
-def chunker(iterable, n, fillvalue=None):
-    args = [iter(iterable)] * n
-    return izip_longest(*args, fillvalue=fillvalue)
+def chunker(l, n):
+    """ Takes a list and returns said list split into chunks of n elements
+    """
+
+    return [l[i:i+n] for i in range(0, len(l), n)]
 
 
 def get_user_input(prompt_options):
@@ -690,17 +693,19 @@ def get_message_ids(cnx):
         raise StopIteration
 
 
-def get_messages(cnx, chunksize):
-    """ Generator that returns tuples of (flags, message).
+def fetch_message_chunk(cnx, start_uid, end_uid):
+    """ Fetch messages start_uid:end_uid from the IMAP server
 
-    chunksize is the number of messages to download from the IMAP server in one
-    fetch command.
-
+    Returns a dictionary of {uid: RFC822 message}
     """
+    resp = cnx.uid('fetch', '{}:{}'.format(start_uid, end_uid), 'RFC822')
+    if 'OK' == resp[RESPONSE]:
 
-    uids_and_flags = [t for t in get_message_ids(cnx)]
-    uids_and_flags.sort()
-
+    else:
+        raise DieInAFireError('Unable to fetch messages {0}:{1} from IMAP '
+                              'server.\n'
+                              'Reason:\n{2}\n'.format(start_uid, end_uid,
+                                                      resp[DATA][0]))
 
 
 def folder_is_excluded(excluded_folders, folder):
@@ -834,8 +839,21 @@ def migrate_email(imap_cnx, gsrv_cnx, gset_cnx, options):
                     print('{} empty. Skipping ...'.format(folder))
                 else:
                     pbar.maxval = num_emails
-                    pbar.start()
+#                    pbar.start()
                     i = 0
+                    for uid_chunk in chunker([ids for ids in get_message_ids(
+                                                imap_cnx)], MESSAGE_SET_SIZE):
+                        messages = fetch_message_chunk(imap_cnx,
+                                                       uid_chunk[1][0],
+                                                       uid_chunk[-1][0])
+                        print('-------- Chunk Start -------')
+                        for uid, flags in uid_chunk:
+                            print('UID: {} - Flags: {}'.format(uid, str(flags)))
+                            continue
+                        print('-------- Chunk End ---------')
+                        continue
+
+                    comment = """
                     for uid, flags, msg in get_messages(imap_cnx, MESSAGE_SET_SIZE):
                         i += 1
                         mail = imap_cnx.uid('fetch', uid, 'RFC822')
@@ -851,6 +869,7 @@ def migrate_email(imap_cnx, gsrv_cnx, gset_cnx, options):
                             imap_cnx.uid('store', uid, '-FLAGS', '(\\Seen)')
                         pbar.update(i)
                     pbar.finish()
+"""
             else:
                 print("Error converting folder: {}".format(resp[DATA][0]))
 
@@ -865,6 +884,7 @@ def main(args):
 
     rc = 0
     options = {}
+    pprint(args)
     try:
         if args['genconfig']:
             # Ask for name of IMAP folder to place migrated emails
@@ -884,15 +904,21 @@ def main(args):
             open(options['config_path'], 'wb').write(
                         json.dumps(options,indent=4, separators=(',', ': ')))
         elif args['migrate']:
-            cnx.debug = 5
+            print('migrate')
             # Load config file
+            print('loading_config')
             options = load_config(args['--config'])
+            print('finish loading_config')
+            if not options:
+                print('options is blank')
             pprint(options)
             # Log into IMAP
             cnx, _ = imap_login(INPUT['imap_migrate_server'],
                             INPUT['imap_migrate_user'],
                             INPUT['imap_migrate_password'],
                             options)
+            cnx.debug = 5
+
             # Log into Google Migration and Email Settings APIs
             gsrv, gset = google_login(options)
             # prep migration "done" IMAP folder
@@ -917,6 +943,8 @@ def main(args):
         if DEBUG:
             print(getTrace())
         rc = 1
+    except Exception, e:
+        print(getTrace())
 
     return rc
 
